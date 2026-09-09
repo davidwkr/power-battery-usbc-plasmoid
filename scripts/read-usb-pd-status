@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 David (davidwkr)
+# SPDX-License-Identifier: LGPL-2.0-or-later
+set -u
+
+dock_name=""
+dock_authorized=""
+thunderbolt_link=""
+pd_revision=""
+power_role=""
+
+for device in /sys/bus/thunderbolt/devices/*; do
+    [[ -r $device/device_name ]] || continue
+    dock_name=$(<"$device/device_name")
+    [[ -r $device/authorized ]] && dock_authorized=$(<"$device/authorized")
+    if [[ -r $device/rx_lanes && -r $device/rx_speed && -r $device/tx_lanes && -r $device/tx_speed ]]; then
+        rx_lanes=$(<"$device/rx_lanes")
+        rx_speed=$(<"$device/rx_speed")
+        tx_lanes=$(<"$device/tx_lanes")
+        tx_speed=$(<"$device/tx_speed")
+        if [[ $rx_lanes == "$tx_lanes" && $rx_speed == "$tx_speed" ]]; then
+            thunderbolt_link="${rx_lanes} lanes × ${rx_speed}"
+        else
+            thunderbolt_link="RX ${rx_lanes}×${rx_speed}; TX ${tx_lanes}×${tx_speed}"
+        fi
+    fi
+    break
+done
+
+watts=""
+voltage=""
+current=""
+usb_type=""
+
+for supply in /sys/class/power_supply/ucsi-source-psy-*; do
+    [[ -d $supply ]] || continue
+    [[ $(<"$supply/online") == 1 ]] || continue
+
+    voltage_uv=$(<"$supply/voltage_now")
+    current_ua=$(<"$supply/current_now")
+    usb_type=$(<"$supply/usb_type")
+    voltage=$(awk -v value="$voltage_uv" 'BEGIN { printf "%.1f", value / 1000000 }')
+    current=$(awk -v value="$current_ua" 'BEGIN { printf "%.1f", value / 1000000 }')
+    watts=$(awk -v v="$voltage_uv" -v a="$current_ua" 'BEGIN { printf "%.0f", v * a / 1000000000000 }')
+    # Only use a connected port belonging to this supply's controller.
+    # An offline port can retain stale role/revision data after unplugging.
+    candidates=()
+    for port in /sys/class/typec/port[0-9]*; do
+        [[ -r $port/power_role && -d ${port}-partner ]] || continue
+        [[ $(readlink -f "$port/device") == "$(readlink -f "$supply/device")" ]] || continue
+        candidates+=("$port")
+    done
+    if [[ ${#candidates[@]} == 1 ]]; then
+        port=${candidates[0]}
+        [[ -r $port/usb_power_delivery_revision ]] && pd_revision=$(<"$port/usb_power_delivery_revision")
+        roles=$(<"$port/power_role")
+        power_role=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' <<< "$roles")
+    fi
+    break
+done
+
+printf 'usbpd\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$watts" "$voltage" "$current" "$usb_type" "$dock_name" \
+    "$dock_authorized" "$thunderbolt_link" "$pd_revision" "$power_role"
